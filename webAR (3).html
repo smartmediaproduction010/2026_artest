@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no"/>
+  <title>WebAR – Tap to Place</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: 'Segoe UI', sans-serif; }
+
+    #splash {
+      position: fixed; inset: 0; z-index: 100;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+      color: #fff; text-align: center; padding: 2rem;
+      transition: opacity 0.6s ease;
+    }
+    #splash h1 { font-size: 2rem; font-weight: 800; margin-bottom: 0.5rem; }
+    #splash p  { color: rgba(255,255,255,0.6); font-size: 0.9rem; margin-bottom: 2rem; max-width: 280px; line-height: 1.5; }
+    #startBtn {
+      background: linear-gradient(135deg, #a78bfa, #7c3aed);
+      color: #fff; border: none; border-radius: 50px;
+      padding: 0.9rem 2.5rem; font-size: 1.05rem; font-weight: 700;
+      cursor: pointer; box-shadow: 0 0 30px rgba(124,58,237,0.5);
+    }
+    #errMsg { display:none; color:#f87171; font-size:0.85rem; margin-top:1rem; max-width:300px; line-height:1.5; }
+
+    video#bg {
+      position: fixed; inset: 0; width: 100%; height: 100%;
+      object-fit: cover; display: none; z-index: 1;
+    }
+    canvas#c {
+      position: fixed; inset: 0; width: 100%; height: 100%;
+      display: none; z-index: 2; touch-action: none;
+    }
+
+    #ui {
+      position: fixed; bottom: 0; left: 0; right: 0; z-index: 50;
+      display: none; flex-direction: column; align-items: center; padding-bottom: 2.5rem; gap: 0.8rem;
+    }
+    #hint {
+      background: rgba(0,0,0,0.6); backdrop-filter: blur(10px);
+      color: #fff; border-radius: 50px; padding: 0.5rem 1.3rem;
+      font-size: 0.82rem; border: 1px solid rgba(255,255,255,0.15);
+      transition: opacity 0.5s;
+    }
+    #controls { display: flex; gap: 0.6rem; flex-wrap: wrap; justify-content: center; padding: 0 1rem; }
+    .btn {
+      background: rgba(255,255,255,0.12); backdrop-filter: blur(10px);
+      color: #fff; border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 50px; padding: 0.55rem 1.1rem; font-size: 0.78rem;
+      font-weight: 600; cursor: pointer;
+    }
+    .btn.on { background: rgba(167,139,250,0.45); border-color: #a78bfa; }
+
+    #reticle {
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+      width: 44px; height: 44px; z-index: 49; display: none; pointer-events: none;
+      animation: spin 4s linear infinite;
+    }
+    @keyframes spin { to { transform: translate(-50%,-50%) rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<div id="splash">
+  <div style="font-size:3rem;margin-bottom:1rem">💃</div>
+  <h1>WebAR Viewer</h1>
+  <p>Point your camera at the floor or a flat surface, then <strong>tap</strong> to place your model and watch it dance!</p>
+  <button id="startBtn">Start AR</button>
+  <div id="errMsg"></div>
+</div>
+
+<!-- reticle crosshair -->
+<div id="reticle">
+  <svg viewBox="0 0 44 44" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="22" cy="22" r="18" stroke="white" stroke-width="1.5" stroke-dasharray="4 3" opacity="0.8"/>
+    <circle cx="22" cy="22" r="3" fill="white" opacity="0.9"/>
+  </svg>
+</div>
+
+<video id="bg" autoplay playsinline muted></video>
+<canvas id="c"></canvas>
+
+<div id="ui">
+  <div id="hint">👆 Tap anywhere to place the model</div>
+  <div id="controls">
+    <button class="btn on" id="danceBtn">💃 Dance</button>
+    <button class="btn" id="scaleUp">🔍 Bigger</button>
+    <button class="btn" id="scaleDown">🔎 Smaller</button>
+    <button class="btn" id="rotBtn">🔄 Spin</button>
+    <button class="btn" id="resetBtn">🗑 Reset</button>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+<script>
+(() => {
+  const video   = document.getElementById('bg');
+  const canvas  = document.getElementById('c');
+  const splash  = document.getElementById('splash');
+  const ui      = document.getElementById('ui');
+  const hint    = document.getElementById('hint');
+  const reticle = document.getElementById('reticle');
+  const errMsg  = document.getElementById('errMsg');
+
+  // ── Three.js ──────────────────────────────────────────────────────────
+  const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.setClearColor(0x000000, 0);
+
+  const scene  = new THREE.Scene();
+  const fov    = 70;
+  const camera = new THREE.PerspectiveCamera(fov, innerWidth / innerHeight, 0.01, 100);
+  camera.position.set(0, 1.4, 2.2);
+  camera.lookAt(0, 0, 0);
+
+  // Strong ambient so no part of model is ever dark
+  scene.add(new THREE.AmbientLight(0xffffff, 2.5));
+  // Key light from front-top
+  const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+  sun.position.set(2, 5, 4); sun.castShadow = true;
+  scene.add(sun);
+  // Fill light from opposite side
+  const fill = new THREE.DirectionalLight(0xffffff, 1.2);
+  fill.position.set(-3, 3, -2);
+  scene.add(fill);
+  // Rim light from behind
+  const rim = new THREE.DirectionalLight(0xffffff, 0.8);
+  rim.position.set(0, 2, -5);
+  scene.add(rim);
+
+  // Floor shadow receiver
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(8, 8),
+    new THREE.ShadowMaterial({ opacity: 0.22 })
+  );
+  floor.rotation.x = -Math.PI / 2;
+  floor.receiveShadow = true;
+  floor.visible = false;
+  scene.add(floor);
+
+  // ── Model state ───────────────────────────────────────────────────────
+  let root       = null;
+  let mixer      = null;
+  let placed     = false;
+  let dancing    = true;
+  let spinning   = false;
+  let mScale     = 2.5;
+  let danceT     = 0;
+  const clock    = new THREE.Clock();
+
+  // Load GLB
+  new THREE.GLTFLoader().load('elske3dd.glb', gltf => {
+    root = new THREE.Group();
+    const mdl = gltf.scene;
+    mdl.traverse(c => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+
+    // Normalise size
+    const box = new THREE.Box3().setFromObject(mdl);
+    const sz  = new THREE.Vector3(); box.getSize(sz);
+    mdl.scale.setScalar(0.55 / Math.max(sz.x, sz.y, sz.z));
+    box.setFromObject(mdl);
+    mdl.position.y = -box.min.y; // sit on ground
+
+    root.add(mdl);
+    root.visible = false;
+    root.scale.setScalar(mScale);
+    root.rotation.y = -THREE.MathUtils.degToRad(30); // 30° turned right
+    scene.add(root);
+
+    if (gltf.animations?.length) {
+      mixer = new THREE.AnimationMixer(mdl);
+      gltf.animations.forEach(c => mixer.clipAction(c).play());
+    }
+  }, undefined, e => console.error(e));
+
+  // ── Resize ────────────────────────────────────────────────────────────
+  function resize() {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  }
+  window.addEventListener('resize', resize); resize();
+
+  // ── Start camera ──────────────────────────────────────────────────────
+  document.getElementById('startBtn').addEventListener('click', async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+
+      splash.style.opacity = '0';
+      setTimeout(() => splash.style.display = 'none', 600);
+      video.style.display   = 'block';
+      canvas.style.display  = 'block';
+      ui.style.display      = 'flex';
+      reticle.style.display = 'block';
+
+      loop();
+    } catch(e) {
+      errMsg.style.display = 'block';
+      errMsg.textContent   = '⚠️ Camera blocked. Please allow camera access and reload the page.';
+    }
+  });
+
+  // ── Tap to place ──────────────────────────────────────────────────────
+  function place(clientX, clientY) {
+    if (!root) return;
+    // Normalise coords
+    const nx = (clientX / innerWidth)  * 2 - 1;
+    const ny = -(clientY / innerHeight) * 2 + 1;
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(new THREE.Vector2(nx, ny), camera);
+    const floorPlane = new THREE.Plane(new THREE.Vector3(0,1,0), 0);
+    const pt = new THREE.Vector3();
+    ray.ray.intersectPlane(floorPlane, pt);
+    if (!pt) return;
+
+    root.position.set(pt.x, 0, pt.z);
+    floor.position.set(pt.x, 0, pt.z);
+    floor.visible = true;
+    root.visible  = true;
+
+    if (!placed) {
+      placed = true;
+      hint.textContent = '✅ Placed! Tap again to move.';
+      setTimeout(() => hint.style.opacity = '0', 2500);
+    }
+  }
+
+  canvas.addEventListener('click',    e => { if (!e.target.closest('#ui')) place(e.clientX, e.clientY); });
+  canvas.addEventListener('touchend', e => {
+    e.preventDefault();
+    const t = e.changedTouches[0];
+    place(t.clientX, t.clientY);
+  }, { passive: false });
+
+  // ── Dance ─────────────────────────────────────────────────────────────
+  function dance(dt) {
+    if (!root || !dancing || !placed) return;
+    danceT += dt * 2.5;
+    root.position.y  = Math.abs(Math.sin(danceT)) * 0.07;
+    root.rotation.z  = Math.sin(danceT * 0.75) * 0.17;
+    root.rotation.x  = Math.sin(danceT * 1.2)  * 0.07;
+  }
+
+  // ── Render loop ───────────────────────────────────────────────────────
+  function loop() {
+    requestAnimationFrame(loop);
+    const dt = clock.getDelta();
+    if (mixer)   mixer.update(dt);
+    if (dancing && placed) dance(dt);
+    if (spinning && root) root.rotation.y += dt * 1.4;
+    renderer.render(scene, camera);
+  }
+
+  // ── Buttons ───────────────────────────────────────────────────────────
+  document.getElementById('danceBtn').addEventListener('click', () => {
+    dancing = !dancing;
+    document.getElementById('danceBtn').classList.toggle('on', dancing);
+    document.getElementById('danceBtn').textContent = dancing ? '💃 Dance' : '🧍 Stop';
+    if (!dancing && root) { root.rotation.set(0, root.rotation.y, 0); root.position.y = 0; }
+  });
+  document.getElementById('scaleUp').addEventListener('click', () => {
+    mScale = Math.min(mScale + 0.3, 6);
+    if (root) root.scale.setScalar(mScale);
+  });
+  document.getElementById('scaleDown').addEventListener('click', () => {
+    mScale = Math.max(mScale - 0.3, 0.2);
+    if (root) root.scale.setScalar(mScale);
+  });
+  document.getElementById('rotBtn').addEventListener('click', () => {
+    spinning = !spinning;
+    document.getElementById('rotBtn').classList.toggle('on', spinning);
+  });
+  document.getElementById('resetBtn').addEventListener('click', () => {
+    placed = dancing = true; spinning = false; mScale = 1; danceT = 0;
+    if (root) { root.visible = false; root.scale.setScalar(1); root.rotation.set(0,0,0); }
+    floor.visible = false;
+    hint.style.opacity = '1';
+    hint.textContent = '👆 Tap anywhere to place the model';
+    document.getElementById('danceBtn').classList.add('on');
+    document.getElementById('danceBtn').textContent = '💃 Dance';
+    document.getElementById('rotBtn').classList.remove('on');
+  });
+
+})();
+</script>
+</body>
+</html>
